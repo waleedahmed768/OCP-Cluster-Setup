@@ -1,0 +1,211 @@
+OpenShift Setup 
+What is OpenShift ?
+
+OpenShift is basically Kubernetes + extra tools + easier management.
+It helps you run containers in a more organized and secure way.
+
+Basic Idea of Installation
+
+What actually happens:
+
+You prepare machines (VMs or physical servers)
+Setup DNS + Load Balancer + Firewall
+Create config files
+Generate ignition files (these tell machines what to do)
+Boot machines with RHCOS
+Bootstrap node sets up the cluster
+Remove bootstrap node
+Workers join cluster
+What You Need Before Starting
+Machines
+
+Minimum:
+
+1 Bootstrap (temporary)
+3 Master (control plane)
+2 Worker
+
+All machines run RHCOS
+
+Simple sizing:
+Master: 4 CPU, 16 GB RAM
+Worker: 2 CPU, 8 GB RAM
+Disk: at least 120 GB
+Important Things (Don’t Ignore These)
+1. DNS (VERY IMPORTANT )
+
+If DNS is wrong → installation will fail.
+
+You need:
+
+api.cluster.domain
+api-int.cluster.domain
+*.apps.cluster.domain
+records for all nodes (master, worker, bootstrap)
+
+👉 Also reverse DNS (PTR) must work
+If not → node will become localhost → install fails
+
+2. Load Balancer
+
+You must configure LB for:
+
+API → port 6443
+Machine config → 22623
+Apps → 80 & 443
+
+At start:
+
+traffic goes to bootstrap + masters
+
+Later:
+
+only masters
+3. Firewall
+
+Allow ports like:
+
+6443 (API)
+22623
+2379-2380 (etcd)
+10250+
+30000-32767
+4789, 6081 (networking)
+4. Time Sync (NTP)
+
+All nodes must have correct time
+Otherwise certificates will break
+
+Installation Steps (Simple Flow)
+Step 1: Prepare Installer Machine
+
+Download:
+
+OpenShift installer
+oc command
+Pull secret (from Red Hat)
+Step 2: Create Config File
+
+Create folder:
+
+mkdir ocp-install
+cd ocp-install
+
+Create file:
+
+vi install-config.yaml
+
+Add basic info:
+
+domain
+cluster name
+pull secret
+ssh key
+Step 3: Generate Files
+
+Run:
+
+./openshift-install create manifests
+
+Then:
+
+./openshift-install create ignition-configs
+
+You will get:
+
+bootstrap.ign
+master.ign
+worker.ign
+
+👉 These files are VERY important
+
+Step 4: Setup HTTP Server
+
+Copy ignition files:
+
+cp *.ign /var/www/html/
+
+Start web server:
+
+systemctl start httpd
+
+Now nodes will download ignition from here
+
+Step 5: Setup Load Balancer (HAProxy)
+
+You configure HAProxy for:
+
+API (6443)
+Machine config (22623)
+HTTP (80)
+HTTPS (443)
+
+👉 At start include bootstrap in config
+👉 Later remove it
+
+Step 6: Install RHCOS on Machines
+
+Download RHCOS image
+Boot each machine using it
+
+Step 7: Configure Each Node
+
+After boot:
+
+Set network:
+
+nmtui
+
+Set timezone:
+
+timedatectl set-timezone Asia/Karachi
+Step 8: Install Using Ignition
+
+Run on each node:
+
+Bootstrap:
+coreos-installer install --ignition-url=http://server/bootstrap.ign /dev/sda
+Master:
+coreos-installer install --ignition-url=http://server/master.ign /dev/sda
+Worker:
+coreos-installer install --ignition-url=http://server/worker.ign /dev/sda
+Step 9: Wait for Bootstrap
+
+On installer machine:
+
+./openshift-install wait-for bootstrap-complete
+
+👉 After done:
+
+remove bootstrap from load balancer
+Step 10: Finish Installation
+./openshift-install wait-for install-complete
+After Installation
+
+Login:
+
+export KUBECONFIG=auth/kubeconfig
+oc get nodes
+Adding New Worker Node
+
+Just:
+
+Boot new machine
+Use worker.ign
+Approve CSR (if needed)
+oc get csr
+oc adm certificate approve <csr>
+Important Tips (From Experience)
+DNS issues = 80% of failures
+Always check reverse DNS
+Load balancer config must be correct
+Bootstrap must be removed after setup
+At least 2 worker nodes should be healthy
+Time sync must be correct
+Simple Summary
+
+👉 Ignition files = instructions for nodes
+👉 Bootstrap = temporary installer node
+👉 Masters = brain of cluster
+👉 Workers = run apps
+👉 DNS + LB = most critical parts
