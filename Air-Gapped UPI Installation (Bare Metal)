@@ -1,0 +1,221 @@
+OpenShift 4.18.1 Air-Gapped UPI Installation (Bare Metal)
+1. Environment Setup
+export OCP_RELEASE=4.18.1
+export ARCHITECTURE=x86_64
+export PRODUCT_REPO="openshift-release-dev"
+export RELEASE_NAME="ocp-release"
+
+export PULL_SECRET_PATH=/home/admin/ocp/pull-secret.json
+export SAVE_DIR=/home/admin/ocp/images
+
+mkdir -p /home/admin/ocp/images
+2. Authenticate to Red Hat Registry
+podman login registry.redhat.io -u <your-email>
+3. Install OpenShift Client Tools
+cd /home/admin/ocp/
+
+wget -c https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/4.18.1/openshift-client-linux-4.18.1.tar.gz
+
+tar -xvf openshift-client-linux-4.18.1.tar.gz
+
+sudo mv oc kubectl /usr/local/bin/
+oc version
+4. Mirror OpenShift Release Images (Disconnected Prep)
+oc adm release mirror \
+  -a ${PULL_SECRET_PATH} \
+  --from=quay.io/${PRODUCT_REPO}/${RELEASE_NAME}:${OCP_RELEASE}-${ARCHITECTURE} \
+  --to-dir=${SAVE_DIR}
+ 5. Install Mirror Registry (Quay)
+wget -c https://mirror.openshift.com/pub/cgw/mirror-registry/latest/mirror-registry-amd64.tar.gz
+
+tar -xvf mirror-registry-amd64.tar.gz
+
+sudo ./mirror-registry install \
+  --quayHostname mirror.lab.ocp \
+  --initUser admin \
+  --initPassword 'Ak1234'
+6. Firewall Configuration (Registry)
+sudo firewall-cmd --permanent --add-port=8443/tcp
+sudo firewall-cmd --reload
+ 7. Trust Local CA Certificate
+sudo cp rootCA.pem /etc/pki/ca-trust/source/anchors/
+sudo update-ca-trust
+8. Login to Local Registry
+podman login mirror.lab.ocp:8443
+ 9. Push/Import Mirrored Images
+oc image mirror \
+  --from-dir=/home/admin/ocp/images \
+  'file://openshift/release:4.18.1-x86_64*' \
+  mirror.lab.ocp:8443/ocp18/ocpboot
+ 10. Install OpenShift Installer
+wget -c https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/4.18.1/openshift-install-linux-4.18.1.tar.gz
+
+tar -xvf openshift-install-linux-4.18.1.tar.gz
+
+sudo mv openshift-install /usr/local/bin/
+openshift-install version
+11. Install Configuration File
+install-config.yaml
+apiVersion: v1
+baseDomain: abc.com.pk
+
+metadata:
+  name: demo-ocp
+
+compute:
+- name: worker
+  replicas: 0
+  hyperthreading: Enabled
+
+controlPlane:
+  name: master
+  replicas: 3
+  hyperthreading: Enabled
+
+networking:
+  networkType: OVNKubernetes
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  serviceNetwork:
+  - 172.30.0.0/16
+
+platform:
+  none: {}
+
+fips: false
+
+pullSecret: '{"auths":{"mirror.lab.ocp:8443":{"auth":"<base64-auth>"}}}'
+
+sshKey: "ssh-ed25519 AAAA..."
+
+additionalTrustBundle: |
+  -----BEGIN CERTIFICATE-----
+  <ROOT CA>
+  -----END CERTIFICATE-----
+
+imageDigestSources:
+- mirrors:
+  - mirror.lab.ocp:8443/ocp18/ocpboot
+  source: quay.io/openshift-release-dev/ocp-release
+
+- mirrors:
+  - mirror.lab.ocp:8443/ocp18/ocpboot
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+
+capabilities:
+  baselineCapabilitySet: v4.18
+12. Generate Manifests
+openshift-install create manifests --dir=install
+13. Chrony (NTP) Configuration – FINAL
+13.1 Master Chrony (Butane)
+99-master-chrony.bu
+variant: openshift
+version: 4.18.0
+metadata:
+  name: 99-master-chrony
+  labels:
+    machineconfiguration.openshift.io/role: master
+
+storage:
+  files:
+  - path: /etc/chrony.conf
+    mode: 0644
+    overwrite: true
+    contents:
+      inline: |
+        server 10.250.30.240 iburst
+        driftfile /var/lib/chrony/drift
+        makestep 1.0 3
+        rtcsync
+        logdir /var/log/chrony
+Generate YAML
+butane 99-master-chrony.bu -o 99-master-chrony.yaml
+Apply later:
+cp 99-master-chrony.yaml install/openshift/
+13.2 Bootstrap Chrony (Ignition Merge)
+99-bootstrap-chrony.bu
+variant: openshift
+version: 4.18.0
+
+metadata:
+  name: chrony
+  labels:
+    machineconfiguration.openshift.io/role: bootstrap
+
+ignition:
+  config:
+    merge:
+    - source: http://10.250.30.240:8090/ocp418/bootstrap.ign
+
+storage:
+  files:
+  - path: /etc/chrony.conf
+    mode: 0644
+    overwrite: true
+    contents:
+      inline: |
+        server 10.250.30.240 iburst
+        driftfile /var/lib/chrony/drift
+        makestep 1.0 3
+        rtcsync
+        logdir /var/log/chrony
+Generate Ignition
+butane -r 99-bootstrap-chrony.bu -o bootstrap_intermediate.ign
+14. Generate Ignition Configs
+openshift-install create ignition-configs --dir=install
+15. Host Ignition Files (HTTP Server)
+sudo mkdir -p /var/www/html/ocp418
+
+sudo cp install/*.ign /var/www/html/ocp418/
+sudo cp install/metadata.json /var/www/html/ocp418/
+
+sudo chmod 644 /var/www/html/ocp418/*
+sudo restorecon -RFv /var/www/html/ocp418
+
+sudo systemctl enable --now httpd
+
+Test:
+
+curl -I http://mirror.lab.ocp:8090/ocp418/bootstrap.ign
+16. Firewall & HAProxy Ports
+sudo firewall-cmd --permanent --add-service=http
+sudo firewall-cmd --permanent --add-service=https
+sudo firewall-cmd --permanent --add-service=dns
+
+sudo firewall-cmd --permanent --add-port=6443/tcp
+sudo firewall-cmd --permanent --add-port=22623/tcp
+sudo firewall-cmd --permanent --add-port=8090/tcp
+
+sudo firewall-cmd --reload
+17. SELinux Configuration
+sudo semanage port -a -t http_port_t -p tcp 6443
+sudo semanage port -a -t http_port_t -p tcp 22623
+sudo semanage port -a -t http_port_t -p tcp 8090
+
+sudo setsebool -P haproxy_connect_any 1
+18. Install Bootstrap / Master Node
+sudo coreos-installer install /dev/nvme0n1 \
+  --ignition-url=http://mirror.lab.ocp:8090/ocp418/master.ign \
+  --insecure-ignition \
+  --copy-network
+19. Key References
+https://docs.redhat.com/en/documentation/openshift_container_platform/4.17/
+https://docs.redhat.com/en/documentation/disconnected_environments/
+https://openshift-kni.github.io/baremetal-deploy/
+https://access.redhat.com/solutions/6515571
+ Summary Flow
+Export variables
+Mirror OCP images
+Install Quay mirror registry
+Trust CA + firewall setup
+Mirror images locally
+Install OpenShift installer
+Generate install-config
+Create manifests
+Configure chrony (master + bootstrap)
+Generate ignition configs
+Host via HTTP
+Configure HAProxy + firewall
+Boot nodes via coreos-installer
+
